@@ -233,6 +233,11 @@ final_check_status theory_seq::final_check_eh() {
         TRACE("seq", tout << ">>solve_nqs\n";);
         return FC_CONTINUE;
     }
+    if (fixed_length()) {
+        ++m_stats.m_fixed_length;
+        TRACE("seq", tout << ">>fixed_length\n";);
+        return FC_CONTINUE;
+    }
     if (branch_variable()) {
         ++m_stats.m_branch_variable;
         TRACE("seq", tout << ">>branch_variable\n";);
@@ -430,6 +435,7 @@ lbool theory_seq::assume_equality(expr* l, expr* r) {
     return l_undef;
 }
 
+
 bool theory_seq::propagate_length_coherence(expr* e) {
     expr_ref head(m), tail(m);
     rational lo, hi;
@@ -508,6 +514,54 @@ bool theory_seq::check_length_coherence() {
     }
     return false;
 }
+
+bool theory_seq::fixed_length() {
+    obj_hashtable<expr>::iterator it = m_length.begin(), end = m_length.end();
+    bool found = false;
+    for (; it != end; ++it) {
+        if (fixed_length(*it)) {
+            found = true;
+        }
+    }
+    return found;
+}
+
+bool theory_seq::fixed_length(expr* e) {
+    rational lo, hi;
+    if (!(is_var(e) && lower_bound(e, lo) && upper_bound(e, hi) && lo == hi && lo.is_unsigned() && lo.is_pos())) {
+        return false;
+    }
+    if (is_skolem(m_tail, e) || is_skolem(m_seq_first, e) || 
+        is_skolem(m_indexof_left, e) || is_skolem(m_indexof_right, e) ||
+        is_skolem(m_contains_left, e) || is_skolem(m_contains_right, e) ||
+        m_fixed.contains(e)) {
+        return false;
+    }
+
+    context& ctx = get_context();
+    
+    m_trail_stack.push(insert_obj_trail<theory_seq, expr>(m_fixed, e));
+    m_fixed.insert(e);
+
+
+    unsigned _lo = lo.get_unsigned();
+    expr_ref seq(e, m), head(m), tail(m);
+    expr_ref_vector elems(m);
+    
+    for (unsigned j = 0; j < _lo; ++j) {
+        mk_decompose(seq, head, tail);
+        elems.push_back(head);
+        seq = tail;
+    }
+    seq = mk_concat(elems.size(), elems.c_ptr());
+    TRACE("seq", tout << "Fixed: " << mk_pp(e, m) << " " << lo << "\n";);
+    add_axiom(~mk_eq(m_util.str.mk_length(e), m_autil.mk_numeral(lo, true), false), mk_seq_eq(seq, e));
+    if (!ctx.at_base_level()) {
+        m_trail_stack.push(push_replay(alloc(replay_fixed_length, m, e)));
+    }
+    return true;
+}
+
 
 /*
     lit => s != ""
@@ -1778,6 +1832,7 @@ void theory_seq::collect_statistics(::statistics & st) const {
     st.update("seq solve =", m_stats.m_solve_eqs);
     st.update("seq add axiom", m_stats.m_add_axiom);
     st.update("seq extensionality", m_stats.m_extensionality);
+    st.update("seq fixed length", m_stats.m_fixed_length);
 }
 
 void theory_seq::init_model(expr_ref_vector const& es) {
@@ -2623,6 +2678,7 @@ literal theory_seq::mk_seq_eq(expr* a, expr* b) {
 }
 
 literal theory_seq::mk_eq_empty(expr* _e) {
+    context& ctx = get_context();
     expr_ref e(_e, m);
     SASSERT(m_util.is_seq(e));
     expr_ref emp(m);
@@ -2642,9 +2698,9 @@ literal theory_seq::mk_eq_empty(expr* _e) {
     }
     emp = m_util.str.mk_empty(m.get_sort(e));
 
-
     literal lit = mk_eq(e, emp, false);
-    get_context().force_phase(lit);
+    ctx.force_phase(lit);
+    ctx.mark_as_relevant(lit);
     return lit;
 }
 
@@ -3330,16 +3386,15 @@ bool theory_seq::add_prefix2prefix(expr* e, bool& change) {
     }
     expr_ref head1(m), tail1(m), head2(m), tail2(m), conc(m);
 
-    TRACE("seq", tout << mk_pp(e, m) << "\n";);
-
     literal e2_is_emp = mk_eq_empty(e2);
     switch (ctx.get_assignment(e2_is_emp)) {
     case l_true:
-        TRACE("seq", tout << mk_pp(e2, m) << " = empty\n";);
+        TRACE("seq", tout << mk_pp(e, m) << ": " << mk_pp(e2, m) << " = empty\n";
+              ctx.display_literals_verbose(tout, 1, &e2_is_emp); tout << "\n"; );        
         return false; // done
     case l_undef:
         // ctx.force_phase(e2_is_emp);
-        TRACE("seq", tout << mk_pp(e2, m) << " ~ empty\n";);
+        TRACE("seq", tout << mk_pp(e, m) << ": " << mk_pp(e2, m) << " ~ empty\n";);
         return true;  // retry
     default:
         break;
@@ -3352,10 +3407,11 @@ bool theory_seq::add_prefix2prefix(expr* e, bool& change) {
     literal e1_is_emp = mk_eq_empty(e1);
     switch (ctx.get_assignment(e1_is_emp)) {
     case l_true:        
-        TRACE("seq", tout << mk_pp(e1, m) << " = empty\n";);
+        TRACE("seq", tout << mk_pp(e, m) << ": " << mk_pp(e1, m) << " !=  empty\n";);
+        add_axiom(ctx.get_literal(e), ~e1_is_emp);
         return false; // done
     case l_undef:        
-        TRACE("seq", tout << mk_pp(e1, m) << " ~ empty\n";);
+        TRACE("seq", tout << mk_pp(e, m) << ": " << mk_pp(e1, m) << " ~ empty\n";);
         return true;  // retry
     default:
         break;
@@ -3371,11 +3427,11 @@ bool theory_seq::add_prefix2prefix(expr* e, bool& change) {
     case l_true: 
         break;
     case l_false:
-        TRACE("seq", tout << head1 << " = " << head2 << "\n";);
+        TRACE("seq", tout << mk_pp(e, m) << ": " << head1 << " != " << head2 << "\n";);
         return false;
     case l_undef:
         ctx.force_phase(~lit);
-        TRACE("seq", tout << head1 << " ~ " << head2 << "\n";);
+        TRACE("seq", tout << mk_pp(e, m) << ": " << head1 << " ~ " << head2 << "\n";);
         return true;
     }
     change = true;
@@ -3384,7 +3440,7 @@ bool theory_seq::add_prefix2prefix(expr* e, bool& change) {
     lits.push_back(~e2_is_emp);
     lits.push_back(lit);
     propagate_lit(0, lits.size(), lits.c_ptr(), ~mk_literal(m_util.str.mk_prefix(tail1, tail2)));
-    TRACE("seq", tout << "saturate: " << tail1 << " = " << tail2 << "\n";);
+    TRACE("seq", tout << mk_pp(e, m) << " saturate: " << tail1 << " = " << tail2 << "\n";);
     return false;
 }
 

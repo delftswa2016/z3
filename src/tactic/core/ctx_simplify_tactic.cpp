@@ -22,9 +22,30 @@ Notes:
 #include"ast_ll_pp.h"
 #include"ast_pp.h"
 
+
+class ctx_propagate_assertions : public ctx_simplify_tactic::simplifier {
+    ast_manager&         m;
+    obj_map<expr, expr*> m_assertions;
+    expr_ref_vector      m_trail;
+    unsigned_vector      m_scopes;
+
+    void assert_eq_val(expr * t, app * val, bool mk_scope);
+    void assert_eq_core(expr * t, app * val);
+public:
+    ctx_propagate_assertions(ast_manager& m);
+    virtual ~ctx_propagate_assertions() {}
+    virtual bool assert_expr(expr * t, bool sign);
+    virtual bool simplify(expr* t, expr_ref& result);
+    virtual void push();
+    virtual void pop(unsigned num_scopes);
+    virtual unsigned scope_level() const { return m_scopes.size(); }
+    virtual simplifier * translate(ast_manager & m);
+};
+
+
 ctx_propagate_assertions::ctx_propagate_assertions(ast_manager& m): m(m), m_trail(m) {}
 
-void ctx_propagate_assertions::assert_expr(expr * t, bool sign) {
+bool ctx_propagate_assertions::assert_expr(expr * t, bool sign) {
     
     expr * p = t;
     while (m.is_not(t, t)) {
@@ -43,6 +64,7 @@ void ctx_propagate_assertions::assert_expr(expr * t, bool sign) {
         else if (m.is_value(lhs))
             assert_eq_val(rhs, to_app(lhs), mk_scope);
     }
+    return true;
 }
 
 void ctx_propagate_assertions::assert_eq_val(expr * t, app * val, bool mk_scope) {
@@ -106,6 +128,10 @@ ctx_simplify_tactic::simplifier * ctx_propagate_assertions::translate(ast_manage
     return alloc(ctx_propagate_assertions, m);
 }
 
+tactic * mk_ctx_simplify_tactic(ast_manager & m, params_ref const & p) {
+    return clean(alloc(ctx_simplify_tactic, m, alloc(ctx_propagate_assertions, m), p));
+}
+
 
 struct ctx_simplify_tactic::imp {
     struct cached_result {
@@ -154,6 +180,7 @@ struct ctx_simplify_tactic::imp {
         pop(scope_level());
         SASSERT(scope_level() == 0);
         restore_cache(0);
+        dealloc(m_simp);
         DEBUG_CODE({
             for (unsigned i = 0; i < m_cache.size(); i++) {
                 CTRACE("ctx_simplify_tactic_bug", m_cache[i].m_from, 
@@ -202,8 +229,8 @@ struct ctx_simplify_tactic::imp {
     }
 
     void cache_core(expr * from, expr * to) {
-        TRACE("ctx_simplify_tactic_cache", tout << "caching\n" << mk_ismt2_pp(from, m) << "\n--->\n" << mk_ismt2_pp(to, m) << "\n";);
         unsigned id = from->get_id();
+        TRACE("ctx_simplify_tactic_cache", tout << "caching " << id << " @ " << scope_level() << "\n" << mk_ismt2_pp(from, m) << "\n--->\n" << mk_ismt2_pp(to, m) << "\n";);
         m_cache.reserve(id+1);
         cache_cell & cell = m_cache[id]; 
         void * mem = m_allocator.allocate(sizeof(cached_result));
@@ -270,11 +297,11 @@ struct ctx_simplify_tactic::imp {
         if (num_scopes == 0)
             return;
         SASSERT(num_scopes <= scope_level());
-        
+
+        unsigned lvl = scope_level();        
         m_simp->pop(num_scopes);
 
         // restore cache
-        unsigned lvl = scope_level();
         for (unsigned i = 0; i < num_scopes; i++) {
             restore_cache(lvl);
             lvl--;
@@ -282,8 +309,8 @@ struct ctx_simplify_tactic::imp {
         CASSERT("ctx_simplify_tactic", check_cache());
     }
 
-    void assert_expr(expr * t, bool sign) {
-        m_simp->assert_expr(t, sign);
+    bool assert_expr(expr * t, bool sign) {
+        return m_simp->assert_expr(t, sign);
     }
 
     bool is_cached(expr * t, expr_ref & r) {
@@ -345,6 +372,9 @@ struct ctx_simplify_tactic::imp {
             simplify(arg, new_arg);
             if (new_arg != arg)
                 modified = true;
+            if (i < num_args - 1 && !m.is_true(new_arg) && !m.is_false(new_arg) && !assert_expr(new_arg, OR))
+                new_arg = m.mk_false();
+
             if ((OR && m.is_false(new_arg)) ||
                 (!OR && m.is_true(new_arg))) {
                 modified = true;
@@ -358,8 +388,6 @@ struct ctx_simplify_tactic::imp {
                 return;
             }
             new_args.push_back(new_arg);
-            if (i < num_args - 1)
-                assert_expr(new_arg, OR);
         }
         pop(scope_level() - old_lvl);
 
@@ -373,6 +401,9 @@ struct ctx_simplify_tactic::imp {
             simplify(arg, new_arg);
             if (new_arg != arg)
                 modified = true;
+            if (i > 0 && !m.is_true(new_arg) && !m.is_false(new_arg) && !assert_expr(new_arg, OR))
+                new_arg = m.mk_false();
+
             if ((OR && m.is_false(new_arg)) ||
                 (!OR && m.is_true(new_arg))) {
                 modified = true;
@@ -386,8 +417,6 @@ struct ctx_simplify_tactic::imp {
                 return;
             }
             new_new_args.push_back(new_arg);
-            if (i > 0)
-                assert_expr(new_arg, OR);
         }
         pop(scope_level() - old_lvl);
 
@@ -423,10 +452,18 @@ struct ctx_simplify_tactic::imp {
         else {
             expr_ref new_t(m);
             expr_ref new_e(m);
-            assert_expr(new_c, false);
+            if (!assert_expr(new_c, false)) {
+                simplify(e, r);
+                cache(ite, r);
+                return;
+            }
             simplify(t, new_t);
             pop(scope_level() - old_lvl);
-            assert_expr(new_c, true);
+            if (!assert_expr(new_c, true)) {
+                r = new_t;
+                cache(ite, r);
+                return;
+            }
             simplify(e, new_e);
             pop(scope_level() - old_lvl);
             if (c == new_c && t == new_t && e == new_e) {
@@ -536,13 +573,15 @@ struct ctx_simplify_tactic::imp {
 
 ctx_simplify_tactic::ctx_simplify_tactic(ast_manager & m, simplifier* simp, params_ref const & p):
     m_imp(alloc(imp, m, simp, p)),
-    m_params(p),
-    m_simp(simp) {
+    m_params(p) {
+}
+
+tactic * ctx_simplify_tactic::translate(ast_manager & m) {
+    return alloc(ctx_simplify_tactic, m, m_imp->m_simp->translate(m), m_params);
 }
 
 ctx_simplify_tactic::~ctx_simplify_tactic() {
     dealloc(m_imp);
-    dealloc(m_simp);
 }
 
 void ctx_simplify_tactic::updt_params(params_ref const & p) {
@@ -570,7 +609,7 @@ void ctx_simplify_tactic::operator()(goal_ref const & in,
 
 void ctx_simplify_tactic::cleanup() {
     ast_manager & m   = m_imp->m;
-    imp * d = alloc(imp, m, m_simp->translate(m), m_params);
+    imp * d = alloc(imp, m, m_imp->m_simp->translate(m), m_params);
     std::swap(d, m_imp);    
     dealloc(d);
 }
